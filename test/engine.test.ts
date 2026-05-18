@@ -8226,11 +8226,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
     // `same-path-shrink`, which IS in the allowNoAnchorImport whitelist.
     //
     // Fix: seed a placeholder bootstrap_state row directly (no stat call)
-    // anchored to the current sessionFile with `lastProcessedOffset=0`. On
-    // the next afterTurn whose stat() succeeds, the append-only fast path
-    // reads from offset=0 and ingests the full transcript, with
-    // identity_hash dedup preventing re-ingestion of anything already in
-    // the DB.
+    // anchored to the current sessionFile with `lastProcessedOffset=0`.
+    // On the next afterTurn whose stat() succeeds, the placeholder recovery
+    // path re-walks from offset=0 but reconciles against the DB frontier so
+    // already-ingested live afterTurn messages are not duplicated.
     const warnLog = vi.fn();
     const engine = createEngineWithDeps(
       {},
@@ -8278,7 +8277,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
     });
 
     // Placeholder checkpoint must exist pointing at the current sessionFile
-    // with offset=0 so the next turn takes the fast path.
+    // with offset=0 so the next turn can recover from the beginning.
     const seededState = await engine
       .getSummaryStore()
       .getConversationBootstrapState(conversation!.conversationId);
@@ -8293,8 +8292,9 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(statFailWarn).toBeDefined();
     expect(statFailWarn).toContain("seeding placeholder bootstrap_state at offset=0");
 
-    // Second turn: transcript now exists with real content. The append-only
-    // fast path should read from offset=0 and ingest every message.
+    // Second turn: transcript now exists with real content. Placeholder
+    // recovery should read from offset=0 but only ingest messages after the
+    // already-stored frontier.
     writeLeafTranscript(sessionFile, [
       { role: "user", content: "first user turn" },
       { role: "assistant", content: "first assistant turn" },
@@ -8311,9 +8311,10 @@ describe("LcmContextEngine fidelity and token budget", () => {
       tokenBudget: 4_096,
     });
 
-    // Without the fix, ingestion stays at 0 messages forever. With the
-    // fix, the fast path reads offset=0 and ingests all four transcript
-    // messages on the second turn.
+    // Without the checkpoint seed, ingestion stays at 0 messages forever.
+    // With placeholder recovery, only genuinely missing transcript messages
+    // are imported; the first turn was already persisted by the live
+    // afterTurn batch and must not be replayed from offset=0.
     const messages = await engine
       .getConversationStore()
       .getMessages(conversation!.conversationId);
@@ -8322,6 +8323,34 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(contents).toContain("first assistant turn");
     expect(contents).toContain("second user turn");
     expect(contents).toContain("second assistant turn");
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "user", "first user turn"),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(
+          conversation!.conversationId,
+          "assistant",
+          "first assistant turn",
+        ),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "user", "second user turn"),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(
+          conversation!.conversationId,
+          "assistant",
+          "second assistant turn",
+        ),
+    ).resolves.toBe(1);
 
     // After successful ingest, checkpoint should be advanced past offset=0
     // (via the fast-path refreshBootstrapState call).

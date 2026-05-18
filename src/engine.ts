@@ -5054,6 +5054,34 @@ export class LcmContextEngine implements ContextEngine {
             offset: checkpoint.lastProcessedOffset,
           });
           if (appended.canUseAppendOnly) {
+            const placeholderCheckpoint =
+              checkpoint.lastSeenSize === 0 &&
+              checkpoint.lastSeenMtimeMs === 0 &&
+              checkpoint.lastProcessedOffset === 0 &&
+              checkpoint.lastProcessedEntryHash === null;
+            if (placeholderCheckpoint && appended.messages.length > 0) {
+              const reconcile = await this.reconcileSessionTail({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                conversationId: conversation.conversationId,
+                historicalMessages: appended.messages,
+                noAnchorImportReason: "placeholder-checkpoint-recovery",
+              });
+              if (reconcile.importedMessages > 0) {
+                this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+                this.recordRecentBootstrapImport(
+                  conversation.conversationId,
+                  reconcile.importedMessages,
+                  "reconciled missing session messages",
+                );
+                await this.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+              }
+              return reconcile;
+            }
+
             const replayFilteredMessages = await this.filterBootstrapReplayMessages({
               messages: appended.messages,
               sessionContext: this.formatSessionLogContext({
