@@ -667,16 +667,14 @@ export function buildMessageParts(params: {
     // though the rehydrated provider-facing block stays a whitespace text
     // block (adapters only accept text/image in toolResult content).
     const details = (message as { details?: unknown }).details;
-    const EMPTY_FALLBACK_DETAILS_MAX_BYTES = 65536;
     let detailsEntry: Record<string, unknown> = {};
     if (details !== undefined) {
-      const serialized = toJson(details);
-      const serializedBytes = Buffer.byteLength(serialized ?? "", "utf8");
-      if (serialized !== undefined && serializedBytes <= EMPTY_FALLBACK_DETAILS_MAX_BYTES) {
-        detailsEntry = { details };
-      } else {
-        detailsEntry = { detailsOversize: { byteSize: serializedBytes } };
-      }
+      // Persist intact: for an empty-content result there are no content
+      // blocks for large-result interception to externalize and raw-payload
+      // externalization skips tool roles, so a byte-size stub would be the
+      // ONLY record — unrecoverable data loss. The lossless invariant wins
+      // over metadata size concerns (update_plan-scale payloads are small).
+      detailsEntry = { details };
     }
     parts.push({
       sessionId,

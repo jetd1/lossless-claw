@@ -239,6 +239,11 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
 ): { message: T; dropped: DroppedToolUse[]; keptFingerprints: KeptToolUseFingerprints } {
   const { dropAll = false, record = true, consumedReuses } = options;
   const keptFingerprints: KeptToolUseFingerprints = new Map();
+  // One assistant turn may NEVER emit two tool-call blocks with the same id
+  // (strict providers reject same-id calls within a turn). Recurrent ids are
+  // only reusable across turns — collapse same-id repeats here keep-first,
+  // regardless of argument fingerprints.
+  const keptIdsInThisMessage = new Set<string>();
   const content = msg.content;
   if (!Array.isArray(content)) {
     return { message: msg, dropped: [], keptFingerprints };
@@ -257,6 +262,14 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
       const isToolUse =
         !!id && typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type);
       if (isToolUse && id) {
+        if (keptIdsInThisMessage.has(id) && !dropAll) {
+          dropped.push({
+            id,
+            name: typeof rec.name === "string" ? rec.name : undefined,
+            reason: "duplicate",
+          });
+          continue;
+        }
         const fingerprint = fingerprintToolUseBlock(block);
         // A byte-identical repeat of a STILL-PENDING call is a store
         // double-write (keep-first drop). A repeat of an already-paired
@@ -278,6 +291,7 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
           continue;
         }
         const keptList = keptFingerprints.get(id);
+        keptIdsInThisMessage.add(id);
         if (keptList) {
           keptList.push(fingerprint);
         } else {
@@ -662,23 +676,23 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
           }
           break;
         }
-        if (preview.dropped.length > 0) {
-          // Fully-duplicate assistant (nothing but dropped blocks left) whose
-          // dropped ids all belong to this span AND already have a collected
-          // in-span result: defer it to its own main pass — after this span's
-          // pair retires the fingerprint it may legitimately survive as a new
-          // occurrence (e.g. `pwd` twice). Single-result transcripts fall
-          // through to the swallow path below (keep-first store-dup).
+        if (preview.dropped.length > 0 && !nextTerminal) {
+          // Assistant whose dropped duplicate ids all belong to this span AND
+          // already have a collected in-span result: defer the WHOLE assistant
+          // (text and all) to its own main pass — after this span's pair
+          // retires the fingerprints its repeated call may legitimately
+          // survive as a new occurrence (`pwd` twice). Must not depend on the
+          // message emptying: a text-bearing identical repeat otherwise lost
+          // its second call/result pair entirely. Single-result transcripts
+          // fall through to the swallow path below (keep-first store-dup).
           const droppedIdsDeferred = preview.dropped.every(
             (drop) => toolCallIds.has(drop.id) && spanResultsById.has(drop.id),
           );
-          if (
-            droppedIdsDeferred &&
-            preview.dropped.length > 0 &&
-            isEmptyAfterToolUseDrop(preview.message.content)
-          ) {
+          if (droppedIdsDeferred) {
             break;
           }
+        }
+        if (preview.dropped.length > 0) {
           changed = true;
           recordAssistantToolUseDrops(preview.dropped);
           if (isEmptyAfterToolUseDrop(preview.message.content)) {

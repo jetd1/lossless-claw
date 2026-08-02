@@ -549,4 +549,44 @@ describe("sanitizeToolUseResultPairing recurrent-id occurrence semantics", () =>
     expect(resultContents[0]).toContain("missing tool result");
     expect(resultContents[1]).toContain("real-for-b");
   });
+
+  it("reprocesses text-bearing identical recurrent calls instead of swallowing them", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      { role: "assistant", content: [{ type: "toolCall", id: "exec:11", name: "exec", arguments: { command: "pwd" } }] },
+      { role: "toolResult", toolCallId: "exec:11", content: [{ type: "text", text: "/home/jet" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "again:" },
+          { type: "toolCall", id: "exec:11", name: "exec", arguments: { command: "pwd" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "exec:11", content: [{ type: "text", text: "/home/jet" }] },
+    ]);
+    const texts = JSON.stringify(out);
+    expect(out.filter((m) => m.role === "assistant").length).toBe(2);
+    expect(out.filter((m) => m.role === "toolResult").length).toBe(2);
+    expect(texts).toContain("again:");
+    expect(texts).not.toContain("missing tool result");
+  });
+
+  it("collapses same-id tool calls within a single assistant turn (keep-first)", () => {
+    const out = sanitizeToolUseResultPairing<Msg>([
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "exec:13", name: "exec", arguments: { command: "ls a" } },
+          { type: "toolCall", id: "exec:13", name: "exec", arguments: { command: "ls b" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "exec:13", content: [{ type: "text", text: "ok" }] },
+    ]);
+    const calls = out
+      .filter((m) => m.role === "assistant")
+      .flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type?: string }>) : []))
+      .filter((b) => b && typeof b.type === "string" && b.type === "toolCall");
+    expect(calls.length).toBe(1);
+    expect(out.filter((m) => m.role === "toolResult").length).toBe(1);
+    expect(JSON.stringify(out)).not.toContain("missing tool result");
+  });
 });

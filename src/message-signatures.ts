@@ -196,10 +196,20 @@ export function createCanonicalEmptyToolResultCoverageSignature(
   if (part.toolInput != null) {
     return undefined;
   }
+  const toolCallId = part.toolCallId ?? extractToolResultIdForPairing(message) ?? null;
   if (part.partType === "text") {
-    // Whitespace-only text on a toolResult message: the text-block
-    // rehydration of the empty-content fallback (#992).
+    // Whitespace-only text on a tool-result message: the text-block
+    // rehydration of the empty-content fallback (#992). After a DB round-trip
+    // the reconstructed part may carry metadata.originalRole:"toolResult"
+    // with rawType:"text" (no longer tool-shaped), so gate on the message
+    // role + whitespace content instead of tool-part shape.
     if ((part.textContent ?? "").trim() !== "") {
+      return undefined;
+    }
+    if (stored.role !== "tool" && stored.role !== "toolResult") {
+      return undefined;
+    }
+    if (!toolCallId) {
       return undefined;
     }
   } else if (part.partType === "tool") {
@@ -208,13 +218,12 @@ export function createCanonicalEmptyToolResultCoverageSignature(
     if (!isEffectivelyEmptyToolResultPart(part, fallbackContent)) {
       return undefined;
     }
+    if (!isToolResultShapedPart(part)) {
+      return undefined;
+    }
   } else {
     return undefined;
   }
-  if (!isToolResultShapedPart(part)) {
-    return undefined;
-  }
-  const toolCallId = part.toolCallId ?? extractToolResultIdForPairing(message) ?? null;
   if (!toolCallId) {
     // Identity-less results cannot be canonicalized without collision risk:
     // two distinct id-less results would otherwise map to the same key and
