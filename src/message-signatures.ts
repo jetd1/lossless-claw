@@ -6,6 +6,7 @@
 import { buildMessageParts, toStoredMessage, type StoredMessage } from "./message-content.js";
 import type { AgentMessage } from "./openclaw-bridge.js";
 import { canonicalizeOpenClawInboundMetadataIdentityContent } from "./openclaw-inbound-metadata.js";
+import { isProviderUniqueToolCallId } from "./stable-event-key.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
 import { extractBootstrapMessageCandidate } from "./transcript.js";
@@ -198,10 +199,21 @@ export function createCanonicalEmptyToolResultCoverageSignature(
     // one side could be silently swallowed by coverage dedup.
     return undefined;
   }
+  if (!isProviderUniqueToolCallId(toolCallId)) {
+    // Model-authored ids (Kimi K3 `name:N` counters) recur across turns, so
+    // (role, toolCallId) does NOT identify an event: an id-less content match
+    // here would let coverage consumers (e.g. resolveForkBoundedLiveSuffix)
+    // treat an OLDER occurrence as proof a NEWER occurrence is covered and
+    // slice real events out of the request. Restrict the canonical shortcut
+    // to provider-unique ids; everything else keeps the full lossless
+    // signature, preferring a possible double-emit over a silent suppression.
+    return undefined;
+  }
   // toolName is intentionally omitted from the key: the same logical result
   // may appear with a top-level toolName (DB round-trip) or without one
-  // (live transcript block only), and toolCallId is the unique pairing
-  // identity — two results with the same toolCallId ARE the same result.
+  // (live transcript block only), and a provider-unique toolCallId is then
+  // an event-unique pairing identity — two results with the same provider-
+  // unique toolCallId ARE the same event.
   return JSON.stringify({
     kind: "canonical-empty-tool-result",
     role: stored.role,

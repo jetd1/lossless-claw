@@ -636,17 +636,23 @@ export function buildMessageParts(params: {
   // empty, and `sanitizeToolUseResultPairing` then injects a synthetic
   // "missing tool result" error on every assemble while the call is in the
   // context window. Persist one fallback part that carries the pairing
-  // identity so assembly can reconstruct the toolResult. Role-gated (not
-  // id-gated): pre-existing routing in blockFromPart treats a metadata-less
-  // "tool" part as a toolCall, so only tool/toolResult roles may land here —
-  // an id-bearing assistant/user message would otherwise be misassembled as
-  // a phantom call. User and assistant empty content intentionally stays
-  // part-less (the empty-content filter and the empty-assistant skip are
-  // desired behavior). Callid-less tool rows keep today's demote-to-assistant
-  // assembly path.
+  // identity so assembly can reconstruct the toolResult.
+  //
+  // Gated on BOTH role and a non-empty pairing id: pre-existing routing in
+  // blockFromPart treats a metadata-less "tool" part as a toolCall, so only
+  // tool/toolResult roles may land here — an id-bearing assistant/user message
+  // would otherwise be misassembled as a phantom call. And without a
+  // toolCallId the rehydrated row demotes to assistant but now carries a
+  // tool_result block with no tool_use_id — malformed provider input — so
+  // ID-less rows keep the legacy zero-part path (demote to assistant with
+  // empty content, dropped by the empty-content filter). User and assistant
+  // empty content intentionally stays part-less (the empty-content filter and
+  // the empty-assistant skip are desired behavior).
   if (
     message.content.length === 0 &&
     (role === "tool" || role === "toolResult") &&
+    typeof topLevelToolCallId === "string" &&
+    topLevelToolCallId.length > 0 &&
     !rawPayloadExternalized
   ) {
     parts.push({

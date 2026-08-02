@@ -85,11 +85,13 @@ describe("buildMessageParts empty-content tool-result fallback", () => {
     });
   });
 
-  it("handles callid-less tool rows without crashing (assembly still demotes)", () => {
+  it("handles callid-less tool rows via the legacy zero-part path (assembly demotes)", () => {
+    // No pairing id: a fallback part would rehydrate into an assistant message
+    // carrying a tool_result block with no tool_use_id — malformed provider
+    // input. ID-less empty rows keep the legacy zero-part behavior (demote
+    // to assistant, dropped by the empty-content filter).
     const parts = partsOf({ role: "tool", content: [] } as unknown as AgentMessage);
-    expect(parts).toHaveLength(1);
-    expect(parts[0]!.toolCallId).toBeNull();
-    expect(parts[0]!.toolName).toBeNull();
+    expect(parts).toHaveLength(0);
   });
 
   it("does NOT create parts for genuinely empty assistant messages", () => {
@@ -199,14 +201,19 @@ describe("fallback part assembly routing", () => {
 });
 
 describe("live-coverage signature stability across DB round-trip", () => {
-  it("live empty-content result matches its assembled reconstruction (no id)", () => {
-    const liveMessage = makeEmptyResult();
+  it("live empty-content result matches its assembled reconstruction", () => {
+    const liveMessage = makeEmptyResult({ toolCallId: "call_0123456789abcdef" });
     const assembled = {
       role: "toolResult",
-      toolCallId: "call_1",
+      toolCallId: "call_0123456789abcdef",
       toolName: "update_plan",
       content: [
-        { type: "tool_result", name: "update_plan", output: " ", tool_use_id: "call_1" },
+        {
+          type: "tool_result",
+          name: "update_plan",
+          output: " ",
+          tool_use_id: "call_0123456789abcdef",
+        },
       ],
     } as unknown as AgentMessage;
     expect(createLiveCoverageSignature(liveMessage)).toBe(
@@ -217,26 +224,54 @@ describe("live-coverage signature stability across DB round-trip", () => {
   it("live empty-content result with tool_use_id block id matches assembly", () => {
     // The live shape carries the tool_result block with tool_use_id but may
     // lack a top-level toolName. The assembled shape has toolName filled in
-    // from part metadata. Both have the same toolCallId, so the canonical
-    // empty-tool-result signature keys on (role, toolCallId) only — toolName
-    // is intentionally omitted because it may be present on one
-    // representation and absent on the other.
+    // from part metadata. Both have the same provider-unique toolCallId, so
+    // the canonical empty-tool-result signature keys on (role, toolCallId)
+    // only — toolName is intentionally omitted because it may be present on
+    // one representation and absent on the other.
     const liveIded = {
       role: "toolResult",
-      toolCallId: "call_1",
-      content: [{ type: "tool_result", tool_use_id: "call_1", output: "" }],
+      toolCallId: "call_0123456789abcdef",
+      content: [{ type: "tool_result", tool_use_id: "call_0123456789abcdef", output: "" }],
     } as unknown as AgentMessage;
     const assembled = {
       role: "toolResult",
-      toolCallId: "call_1",
+      toolCallId: "call_0123456789abcdef",
       toolName: "update_plan",
       content: [
-        { type: "tool_result", name: "update_plan", output: " ", tool_use_id: "call_1" },
+        {
+          type: "tool_result",
+          name: "update_plan",
+          output: " ",
+          tool_use_id: "call_0123456789abcdef",
+        },
       ],
     } as unknown as AgentMessage;
     expect(createLiveCoverageSignature(liveIded)).toBe(
       createLiveCoverageSignature(assembled),
     );
+  });
+
+  it("canonical empty-result signature refuses recurrent model-authored ids", () => {
+    // Kimi K3 `name:N` counters recur across turns: (role, toolCallId) does
+    // not identify an event, so recurrent ids must fall back to the full
+    // lossless signature (byte-shaped), distinct per representation.
+    const liveRecurrent = makeEmptyResult({ toolCallId: "update_plan:7" });
+    expect(createLiveCoverageSignature(liveRecurrent)).not.toContain(
+      "canonical-empty-tool-result",
+    );
+    const assembledRecurrent = {
+      role: "toolResult",
+      toolCallId: "update_plan:7",
+      content: [
+        { type: "tool_result", output: " ", tool_use_id: "update_plan:7" },
+      ],
+    } as unknown as AgentMessage;
+    expect(createLiveCoverageSignature(assembledRecurrent)).not.toContain(
+      "canonical-empty-tool-result",
+    );
+    expect(
+      createLiveCoverageSignature(makeEmptyResult({ toolCallId: "toolu_01CanonicalTestID" })),
+    ).toContain("canonical-empty-tool-result");
   });
 
   it("live empty-content result with NO call id does not signature-collide with an ided row", () => {

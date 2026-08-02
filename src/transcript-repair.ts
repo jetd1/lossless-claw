@@ -194,23 +194,41 @@ function isEmptyAfterToolUseDrop(content: unknown): boolean {
 }
 
 /**
+ * Fingerprint one tool_use block for occurrence-scoped duplicate detection.
+ * Model-authored ids (Kimi K3 `name:N`) legitimately recur across turns; two
+ * tool_use blocks share an EVENT only when id AND payload match (the store
+ * double-write case). Same id with different arguments is a new occurrence.
+ */
+function fingerprintToolUseBlock(block: unknown): string {
+  try {
+    return JSON.stringify(block);
+  } catch {
+    return String(block);
+  }
+}
+
+/**
  * Remove duplicate assistant `tool_use` blocks during assembly.
  *
  * The Anthropic Messages API rejects a turn containing two assistant tool_use
  * blocks that share an id. Duplicate-ingest can place the same tool_use id on
- * more than one assistant message. This filters tool_use blocks whose id has
- * already been emitted earlier in the assembled transcript (keep-first), while
- * preserving every other block (text, distinct tool calls).
+ * more than one assistant message. This filters tool_use blocks whose id AND
+ * payload fingerprint were already emitted (keep-first), while preserving
+ * every other block (text, distinct tool calls) — including a legitimate
+ * reuse of a recurrent model-authored id with different arguments.
  *
- * - record:false leaves surviving ids out of the seen set. Used for
- *   error/aborted turns, which are non-pairable and must not "claim" an id that
- *   a later valid turn legitimately reuses.
- * - dropAll:true strips every tool_use block regardless of the seen set. Also
+ * - `seenToolUseFingerprints` maps each emitted id to every block fingerprint
+ *   it was emitted with. Identity is (id, fingerprint), never the bare id —
+ *   recurrent `name:N` ids (Kimi K3) recur across turns as distinct events.
+ * - record:false leaves surviving fingerprints out of the seen map. Used for
+ *   error/aborted turns, which are non-pairable and must not "claim" an id
+ *   that a later valid turn legitimately reuses.
+ * - dropAll:true strips every tool_use block regardless of the seen map. Also
  *   used for error/aborted turns, whose tool_use blocks may be incomplete.
  */
 function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
   msg: T,
-  seenToolUseIds: Set<string>,
+  seenToolUseFingerprints: Map<string, Set<string>>,
   options: { dropAll?: boolean; record?: boolean } = {}
 ): { message: T; dropped: DroppedToolUse[] } {
   const { dropAll = false, record = true } = options;
@@ -232,7 +250,8 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
       const isToolUse =
         !!id && typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type);
       if (isToolUse && id) {
-        if (dropAll || seenToolUseIds.has(id)) {
+        const fingerprint = fingerprintToolUseBlock(block);
+        if (dropAll || seenToolUseFingerprints.get(id)?.has(fingerprint)) {
           dropped.push({
             id,
             name: typeof rec.name === "string" ? rec.name : undefined,
@@ -241,7 +260,12 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
           continue;
         }
         if (record) {
-          seenToolUseIds.add(id);
+          const fingerprints = seenToolUseFingerprints.get(id);
+          if (fingerprints) {
+            fingerprints.add(fingerprint);
+          } else {
+            seenToolUseFingerprints.set(id, new Set([fingerprint]));
+          }
         }
       }
     }
@@ -251,6 +275,19 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
     return { message: msg, dropped };
   }
   return { message: { ...msg, content: kept } as T, dropped };
+}
+
+
+/** Deep-copy the seen-fingerprint registry for preview passes so speculative
+ * registrations never leak into the real pairing state. */
+function copyToolUseFingerprints(
+  source: Map<string, Set<string>>,
+): Map<string, Set<string>> {
+  const copy = new Map<string, Set<string>>();
+  for (const [id, fingerprints] of source) {
+    copy.set(id, new Set(fingerprints));
+  }
+  return copy;
 }
 
 // -- Repair logic (from session-transcript-repair.ts) --
@@ -307,17 +344,30 @@ function makeMissingToolResult(params: {
  * calls are not immediately followed by matching tool results. This function:
  * - Moves matching toolResult messages directly after their assistant toolCall turn
  * - Inserts synthetic error toolResults for missing IDs
- * - Drops duplicate toolResults for the same ID
+ * - Drops duplicate toolResults (an id emitted while no identical call is
+ *   awaiting its result)
  * - Drops orphaned toolResults with no matching tool call
+ *
+ * Pairing is OCCURRENCE-SCOPED, never global-id. Tool-call ids are authored by
+ * the model and recur across turns (Kimi K3 `name:N` counters), so an id is
+ * treated as a duplicate only while an identical earlier call still awaits its
+ * result; each paired id becomes reusable again immediately.
  */
 export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
   messages: T[],
   log?: WarnLogger
 ): T[] {
   const out: T[] = [];
-  const seenToolResultIds = new Set<string>();
-  const toolResultPositions = new Map<string, number>();
-  const seenToolUseIds = new Set<string>();
+  // Occurrence-scoped pairing state. Tool-call ids are authored by the model
+  // and recur across turns (Kimi K3 `name:N` counters), so duplication is
+  // (id, payload-fingerprint), never the bare id: a legitimate reuse with
+  // different arguments must survive, while a byte-identical repeat (store
+  // double-write) is still dropped keep-first.
+  const seenToolUseFingerprints = new Map<string, Set<string>>();
+  // Per id, the out-indexes of every emitted result, in emission order. A
+  // later real result may replace the LATEST synthetic placeholder for its id
+  // (backfill repair); positions of earlier real results stay frozen.
+  const emittedResultPositions = new Map<string, number[]>();
   const movedToolResultIndexes = new Set<number>();
   let droppedDuplicateCount = 0;
   let droppedDuplicateAssistantToolUseCount = 0;
@@ -336,23 +386,29 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     }
   };
 
+  const replaceLatestSyntheticResult = (id: string, candidate: T): boolean => {
+    const positions = emittedResultPositions.get(id);
+    if (!positions || positions.length === 0) {
+      return false;
+    }
+    const latestIndex = positions[positions.length - 1] as number;
+    const existing = out[latestIndex];
+    if (existing && shouldUseCandidateToolResult(existing, candidate)) {
+      out[latestIndex] = candidate;
+      return true;
+    }
+    return false;
+  };
+
   const pushToolResult = (msg: T) => {
     const id = extractToolResultId(msg);
-    if (id && seenToolResultIds.has(id)) {
-      const existingIndex = toolResultPositions.get(id);
-      if (existingIndex !== undefined) {
-        const existing = out[existingIndex];
-        if (existing && shouldUseCandidateToolResult(existing, msg)) {
-          out[existingIndex] = msg;
-        }
-      }
-      droppedDuplicateCount += 1;
-      changed = true;
-      return;
-    }
     if (id) {
-      seenToolResultIds.add(id);
-      toolResultPositions.set(id, out.length);
+      const positions = emittedResultPositions.get(id);
+      if (positions) {
+        positions.push(out.length);
+      } else {
+        emittedResultPositions.set(id, [out.length]);
+      }
     }
     out.push(msg);
   };
@@ -372,6 +428,13 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       if (role !== "toolResult") {
         out.push(msg);
       } else {
+        const orphanId = extractToolResultId(msg);
+        // A late real result may still upgrade the latest synthetic
+        // placeholder emitted earlier for its id (backfill repair).
+        if (orphanId && replaceLatestSyntheticResult(orphanId, msg)) {
+          changed = true;
+          continue;
+        }
         droppedOrphanCount += 1;
         changed = true;
       }
@@ -384,11 +447,12 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     }
 
     // Drop duplicate assistant tool_use blocks (keep-first). Two assistant
-    // tool_use blocks sharing an id cause the Anthropic API to reject the turn.
+    // tool_use blocks sharing an id cause the Anthropic API to reject the turn;
+    // a duplicate is only a block identical to one still awaiting its result.
     const terminal = getTerminalStopReason(normalizedAssistant) !== null;
     const deduped = filterAssistantToolUseBlocks(
       normalizedAssistant,
-      seenToolUseIds,
+      seenToolUseFingerprints,
       // Error/aborted turns are non-pairable: strip their tool_use blocks and
       // do not let them claim an id a later valid turn may legitimately reuse.
       terminal ? { dropAll: true, record: false } : {}
@@ -439,7 +503,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
         const nextTerminal = getTerminalStopReason(normalizedNext) !== null;
         const preview = filterAssistantToolUseBlocks(
           normalizedNext,
-          new Set(seenToolUseIds),
+          copyToolUseFingerprints(seenToolUseFingerprints),
           nextTerminal ? { dropAll: true, record: false } : {}
         );
         const nextToolCalls = nextTerminal
@@ -447,9 +511,24 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
           : extractToolCallsFromAssistant(preview.message);
         if (nextToolCalls.length > 0) {
           if (preview.dropped.length > 0) {
-            const lookaheadToolUseIds = new Set(seenToolUseIds);
-            for (const call of nextToolCalls) {
-              lookaheadToolUseIds.add(call.id);
+            const lookaheadToolUses = copyToolUseFingerprints(seenToolUseFingerprints);
+            for (const block of Array.isArray(preview.message.content)
+              ? (preview.message.content as unknown[])
+              : []) {
+              if (!block || typeof block !== "object") {
+                continue;
+              }
+              const rec = block as { type?: unknown; id?: unknown; call_id?: unknown };
+              const id = extractToolCallId(rec);
+              if (id && typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type)) {
+                const fingerprint = fingerprintToolUseBlock(block);
+                const fingerprints = lookaheadToolUses.get(id);
+                if (fingerprints) {
+                  fingerprints.add(fingerprint);
+                } else {
+                  lookaheadToolUses.set(id, new Set([fingerprint]));
+                }
+              }
             }
             // The next assistant may mix stale duplicate calls from this span
             // with new calls. Keep that assistant for its own pass, but look
@@ -468,7 +547,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
                   getTerminalStopReason(normalizedCandidate) !== null;
                 const candidatePreview = filterAssistantToolUseBlocks(
                   normalizedCandidate,
-                  new Set(lookaheadToolUseIds),
+                  copyToolUseFingerprints(lookaheadToolUses),
                   candidateTerminal ? { dropAll: true, record: false } : {}
                 );
                 const candidateToolCalls = candidateTerminal
@@ -487,11 +566,6 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
                 continue;
               }
               movedToolResultIndexes.add(k);
-              if (seenToolResultIds.has(id)) {
-                droppedDuplicateCount += 1;
-                changed = true;
-                continue;
-              }
               const existing = spanResultsById.get(id);
               if (shouldUseCandidateToolResult(existing, candidate)) {
                 spanResultsById.set(id, candidate);
@@ -519,11 +593,6 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       if (nextRole === "toolResult") {
         const id = extractToolResultId(next);
         if (id && toolCallIds.has(id)) {
-          if (seenToolResultIds.has(id)) {
-            droppedDuplicateCount += 1;
-            changed = true;
-            continue;
-          }
           const existing = spanResultsById.get(id);
           if (shouldUseCandidateToolResult(existing, next)) {
             spanResultsById.set(id, next);
@@ -554,11 +623,13 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
         continue;
       }
       const id = extractToolResultId(candidate);
-      if (!id || !toolCallIds.has(id) || seenToolResultIds.has(id)) {
+      if (!id || !toolCallIds.has(id)) {
         continue;
       }
       const existing = laterResultsById.get(id);
-      if (shouldUseCandidateToolResult(existing?.message, candidate)) {
+      // Occurrence-ordered pairing: the NEAREST later result pairs this call;
+      // keep-first unless it upgrades a synthetic placeholder.
+      if (!existing || shouldUseCandidateToolResult(existing.message, candidate)) {
         laterResultsById.set(id, { message: candidate, index: k });
       }
     }
