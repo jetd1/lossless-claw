@@ -142,11 +142,19 @@ export function createCanonicalToolTextCoverageSignature(
   ) {
     return undefined;
   }
+  const toolCallId = part.toolCallId ?? extractToolResultIdForPairing(message) ?? null;
+  if (toolCallId && !isProviderUniqueToolCallId(toolCallId)) {
+    // Model-authored recurrent ids (Kimi K3 `name:N`) are not event-unique:
+    // equal content + equal id across DISTINCT events would collapse their
+    // coverage signatures and let an older occurrence prove coverage of a
+    // newer one. Fall back to the full lossless signature instead.
+    return undefined;
+  }
   return JSON.stringify({
     kind: "canonical-tool-text",
     role: stored.role,
     content: fallbackContent,
-    toolCallId: part.toolCallId ?? extractToolResultIdForPairing(message) ?? null,
+    toolCallId,
     toolName: normalizeToolNameForCoverage(part.toolName),
   });
 }
@@ -181,12 +189,26 @@ export function createCanonicalEmptyToolResultCoverageSignature(
     return undefined;
   }
   const part = parts[0] as CreateMessagePartInput;
-  if (part.partType !== "tool" || part.toolInput != null) {
+  // Two rehydrations of the same logical empty result are valid: the legacy
+  // "tool" part (pre-#1054-round-2 DB rows, plus single-tool_result-block
+  // live shapes) and the provider-facing plain text part the empty-content
+  // fallback now assembles into. Reject anything else.
+  if (part.toolInput != null) {
     return undefined;
   }
-  // Effective text must be empty: the fallback sentinel " " or an output
-  // column holding only whitespace — never a real payload.
-  if (!isEffectivelyEmptyToolResultPart(part, fallbackContent)) {
+  if (part.partType === "text") {
+    // Whitespace-only text on a toolResult message: the text-block
+    // rehydration of the empty-content fallback (#992).
+    if ((part.textContent ?? "").trim() !== "") {
+      return undefined;
+    }
+  } else if (part.partType === "tool") {
+    // Effective text must be empty: the fallback sentinel " " or an output
+    // column holding only whitespace — never a real payload.
+    if (!isEffectivelyEmptyToolResultPart(part, fallbackContent)) {
+      return undefined;
+    }
+  } else {
     return undefined;
   }
   if (!isToolResultShapedPart(part)) {

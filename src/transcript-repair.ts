@@ -217,24 +217,31 @@ function fingerprintToolUseBlock(block: unknown): string {
  * every other block (text, distinct tool calls) — including a legitimate
  * reuse of a recurrent model-authored id with different arguments.
  *
- * - `seenToolUseFingerprints` maps each emitted id to every block fingerprint
- *   it was emitted with. Identity is (id, fingerprint), never the bare id —
- *   recurrent `name:N` ids (Kimi K3) recur across turns as distinct events.
+ * - `pendingToolUses` maps each id to the block fingerprints of its calls
+ *   that are still awaiting a result. Identity is (id, fingerprint) of a
+ *   pending call, never the bare id — recurrent `name:N` ids (Kimi K3)
+ *   recur across turns as distinct events, and a fingerprint is retired as
+ *   soon as its call pairs, so even identical repeats survive once paired.
  * - record:false leaves surviving fingerprints out of the seen map. Used for
  *   error/aborted turns, which are non-pairable and must not "claim" an id
  *   that a later valid turn legitimately reuses.
  * - dropAll:true strips every tool_use block regardless of the seen map. Also
  *   used for error/aborted turns, whose tool_use blocks may be incomplete.
  */
+/** Registered (kept) fingerprints per tool-call id from one filter pass. */
+export type KeptToolUseFingerprints = Map<string, string[]>;
+
 function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
   msg: T,
-  seenToolUseFingerprints: Map<string, Set<string>>,
-  options: { dropAll?: boolean; record?: boolean } = {}
-): { message: T; dropped: DroppedToolUse[] } {
-  const { dropAll = false, record = true } = options;
+  pendingToolUses: Map<string, Set<string>>,
+  consumedToolUses: Map<string, Set<string>>,
+  options: { dropAll?: boolean; record?: boolean; consumedReuses?: ReadonlySet<string> } = {}
+): { message: T; dropped: DroppedToolUse[]; keptFingerprints: KeptToolUseFingerprints } {
+  const { dropAll = false, record = true, consumedReuses } = options;
+  const keptFingerprints: KeptToolUseFingerprints = new Map();
   const content = msg.content;
   if (!Array.isArray(content)) {
-    return { message: msg, dropped: [] };
+    return { message: msg, dropped: [], keptFingerprints };
   }
   const dropped: DroppedToolUse[] = [];
   const kept: unknown[] = [];
@@ -251,7 +258,18 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
         !!id && typeof rec.type === "string" && TOOL_CALL_TYPES.has(rec.type);
       if (isToolUse && id) {
         const fingerprint = fingerprintToolUseBlock(block);
-        if (dropAll || seenToolUseFingerprints.get(id)?.has(fingerprint)) {
+        // A byte-identical repeat of a STILL-PENDING call is a store
+        // double-write (keep-first drop). A repeat of an already-paired
+        // (consumed) call is a legitimate fresh occurrence — e.g. `pwd` run
+        // twice with the same recurrent id — UNLESS there is no pairable
+        // later result for it, in which case it collapses as the double-write
+        // remnant. The caller precomputes which consumed ids have a pairable
+        // later result (consumedReuses).
+        if (
+          dropAll ||
+          pendingToolUses.get(id)?.has(fingerprint) ||
+          (consumedToolUses.get(id)?.has(fingerprint) && !consumedReuses?.has(id))
+        ) {
           dropped.push({
             id,
             name: typeof rec.name === "string" ? rec.name : undefined,
@@ -259,12 +277,18 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
           });
           continue;
         }
+        const keptList = keptFingerprints.get(id);
+        if (keptList) {
+          keptList.push(fingerprint);
+        } else {
+          keptFingerprints.set(id, [fingerprint]);
+        }
         if (record) {
-          const fingerprints = seenToolUseFingerprints.get(id);
+          const fingerprints = pendingToolUses.get(id);
           if (fingerprints) {
             fingerprints.add(fingerprint);
           } else {
-            seenToolUseFingerprints.set(id, new Set([fingerprint]));
+            pendingToolUses.set(id, new Set([fingerprint]));
           }
         }
       }
@@ -272,9 +296,9 @@ function filterAssistantToolUseBlocks<T extends AgentMessageLike>(
     kept.push(block);
   }
   if (dropped.length === 0) {
-    return { message: msg, dropped };
+    return { message: msg, dropped, keptFingerprints };
   }
-  return { message: { ...msg, content: kept } as T, dropped };
+  return { message: { ...msg, content: kept } as T, dropped, keptFingerprints };
 }
 
 
@@ -360,10 +384,17 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
   const out: T[] = [];
   // Occurrence-scoped pairing state. Tool-call ids are authored by the model
   // and recur across turns (Kimi K3 `name:N` counters), so duplication is
-  // (id, payload-fingerprint), never the bare id: a legitimate reuse with
-  // different arguments must survive, while a byte-identical repeat (store
-  // double-write) is still dropped keep-first.
-  const seenToolUseFingerprints = new Map<string, Set<string>>();
+  // (id, payload-fingerprint) of a PENDING (result-not-yet-paired) call,
+  // never a conversation-global id: a legitimate reuse — including a repeat
+  // with identical arguments after the first was paired — is a new
+  // occurrence and survives; a byte-identical repeat while the first still
+  // awaits its result is a store double-write and drops keep-first.
+  const pendingToolUses = new Map<string, Set<string>>();
+  // Fingerprints of calls whose occurrence already completed (paired or
+  // synthesized). A repeat of a consumed fingerprint is a fresh occurrence
+  // only when a pairable result still exists for it later in the transcript;
+  // otherwise it is a store double-write remnant of the completed event.
+  const consumedToolUses = new Map<string, Set<string>>();
   // Per id, the out-indexes of every emitted result, in emission order. A
   // later real result may replace the LATEST synthetic placeholder for its id
   // (backfill repair); positions of earlier real results stay frozen.
@@ -450,14 +481,51 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     // tool_use blocks sharing an id cause the Anthropic API to reject the turn;
     // a duplicate is only a block identical to one still awaiting its result.
     const terminal = getTerminalStopReason(normalizedAssistant) !== null;
+    const consumedReuses = new Set<string>();
+    if (!terminal) {
+      const msgBlocks = Array.isArray(normalizedAssistant.content)
+        ? (normalizedAssistant.content as unknown[])
+        : [];
+      for (const block of msgBlocks) {
+        if (!block || typeof block !== "object") {
+          continue;
+        }
+        const rec = block as { type?: unknown; id?: unknown; call_id?: unknown };
+        const id = extractToolCallId(rec);
+        if (!id || typeof rec.type !== "string" || !TOOL_CALL_TYPES.has(rec.type)) {
+          continue;
+        }
+        const fingerprint = fingerprintToolUseBlock(block);
+        if (!consumedToolUses.get(id)?.has(fingerprint)) {
+          continue;
+        }
+        for (let ahead = i + 1; ahead < messages.length; ahead += 1) {
+          if (movedToolResultIndexes.has(ahead)) {
+            continue;
+          }
+          const nextResult = messages[ahead];
+          if (
+            nextResult &&
+            typeof nextResult === "object" &&
+            nextResult.role === "toolResult" &&
+            extractToolResultId(nextResult) === id
+          ) {
+            consumedReuses.add(id);
+            break;
+          }
+        }
+      }
+    }
     const deduped = filterAssistantToolUseBlocks(
       normalizedAssistant,
-      seenToolUseFingerprints,
+      pendingToolUses,
+      consumedToolUses,
       // Error/aborted turns are non-pairable: strip their tool_use blocks and
       // do not let them claim an id a later valid turn may legitimately reuse.
-      terminal ? { dropAll: true, record: false } : {}
+      terminal ? { dropAll: true, record: false } : { consumedReuses }
     );
     const assistantMsg = deduped.message;
+    const keptFingerprints = deduped.keptFingerprints;
     if (deduped.dropped.length > 0) {
       changed = true;
       recordAssistantToolUseDrops(deduped.dropped);
@@ -486,6 +554,9 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
     const spanResultsById = new Map<string, T>();
     const remainder: T[] = [];
 
+    // Ids the breaking assistant turn survives with: results beyond that
+    // turn for these ids belong to the newer occurrence, not this span.
+    const boundaryClaimedIds = new Set<string>();
     let j = i + 1;
     for (; j < messages.length; j += 1) {
       const next = messages[j];
@@ -503,15 +574,21 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
         const nextTerminal = getTerminalStopReason(normalizedNext) !== null;
         const preview = filterAssistantToolUseBlocks(
           normalizedNext,
-          copyToolUseFingerprints(seenToolUseFingerprints),
+          copyToolUseFingerprints(pendingToolUses),
+          copyToolUseFingerprints(consumedToolUses),
           nextTerminal ? { dropAll: true, record: false } : {}
         );
         const nextToolCalls = nextTerminal
           ? []
           : extractToolCallsFromAssistant(preview.message);
         if (nextToolCalls.length > 0) {
+          for (const call of nextToolCalls) {
+            if (toolCallIds.has(call.id)) {
+              boundaryClaimedIds.add(call.id);
+            }
+          }
           if (preview.dropped.length > 0) {
-            const lookaheadToolUses = copyToolUseFingerprints(seenToolUseFingerprints);
+            const lookaheadToolUses = copyToolUseFingerprints(pendingToolUses);
             for (const block of Array.isArray(preview.message.content)
               ? (preview.message.content as unknown[])
               : []) {
@@ -548,6 +625,7 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
                 const candidatePreview = filterAssistantToolUseBlocks(
                   normalizedCandidate,
                   copyToolUseFingerprints(lookaheadToolUses),
+                  copyToolUseFingerprints(consumedToolUses),
                   candidateTerminal ? { dropAll: true, record: false } : {}
                 );
                 const candidateToolCalls = candidateTerminal
@@ -565,14 +643,19 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
               if (!id || !toolCallIds.has(id)) {
                 continue;
               }
-              movedToolResultIndexes.add(k);
               const existing = spanResultsById.get(id);
               if (shouldUseCandidateToolResult(existing, candidate)) {
                 spanResultsById.set(id, candidate);
               }
               if (existing) {
+                // Not selected for THIS span: leave the index un-moved so the
+                // result can still pair a later occurrence of its id (a
+                // recurrent-id reuse), it is only a duplicate for this call.
                 droppedDuplicateCount += 1;
+                changed = true;
+                continue;
               }
+              movedToolResultIndexes.add(k);
               moved = true;
               changed = true;
             }
@@ -580,6 +663,22 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
           break;
         }
         if (preview.dropped.length > 0) {
+          // Fully-duplicate assistant (nothing but dropped blocks left) whose
+          // dropped ids all belong to this span AND already have a collected
+          // in-span result: defer it to its own main pass — after this span's
+          // pair retires the fingerprint it may legitimately survive as a new
+          // occurrence (e.g. `pwd` twice). Single-result transcripts fall
+          // through to the swallow path below (keep-first store-dup).
+          const droppedIdsDeferred = preview.dropped.every(
+            (drop) => toolCallIds.has(drop.id) && spanResultsById.has(drop.id),
+          );
+          if (
+            droppedIdsDeferred &&
+            preview.dropped.length > 0 &&
+            isEmptyAfterToolUseDrop(preview.message.content)
+          ) {
+            break;
+          }
           changed = true;
           recordAssistantToolUseDrops(preview.dropped);
           if (isEmptyAfterToolUseDrop(preview.message.content)) {
@@ -619,11 +718,38 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
         continue;
       }
       const candidate = messages[k];
-      if (!candidate || typeof candidate !== "object" || candidate.role !== "toolResult") {
+      if (!candidate || typeof candidate !== "object") {
+        continue;
+      }
+      if (candidate.role === "assistant") {
+        // Results cannot cross an occurrence boundary: the next assistant turn
+        // that SURVIVES with a same-id call starts a new pending occurrence of
+        // that id, and any result beyond it belongs to the newer occurrence.
+        // Without this bound `[call X(a), call X(b), result X]` would let the
+        // first call steal the second call's result and synthesize a false
+        // missing-result error for the second.
+        const normalizedCandidate = normalizeAssistantReasoningBlocks(candidate as T);
+        const boundaryPreview = filterAssistantToolUseBlocks(
+          normalizedCandidate,
+          copyToolUseFingerprints(pendingToolUses),
+          copyToolUseFingerprints(consumedToolUses),
+          getTerminalStopReason(normalizedCandidate) !== null
+            ? { dropAll: true, record: false }
+            : {}
+        );
+        const survivesBoundaryId = extractToolCallsFromAssistant(boundaryPreview.message).some(
+          (call) => toolCallIds.has(call.id),
+        );
+        if (survivesBoundaryId) {
+          break;
+        }
+        continue;
+      }
+      if (candidate.role !== "toolResult") {
         continue;
       }
       const id = extractToolResultId(candidate);
-      if (!id || !toolCallIds.has(id)) {
+      if (!id || !toolCallIds.has(id) || boundaryClaimedIds.has(id)) {
         continue;
       }
       const existing = laterResultsById.get(id);
@@ -641,7 +767,15 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
       changed = true;
     }
 
+    const emittedCallIds = new Set<string>();
     for (const call of toolCalls) {
+      // One result per id per assistant turn, even if the turn carries
+      // multiple same-id blocks; pairing is by id, so a second same-id call
+      // here stays pending for a genuinely later result.
+      if (emittedCallIds.has(call.id)) {
+        continue;
+      }
+      emittedCallIds.add(call.id);
       let existing = spanResultsById.get(call.id);
       const later = laterResultsById.get(call.id);
       if (later && shouldUseCandidateToolResult(existing, later.message)) {
@@ -659,6 +793,25 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
         });
         changed = true;
         pushToolResult(missing as T);
+      }
+    }
+    // Occurrence completed (paired or synthesized): retire only the
+    // fingerprints THIS assistant registered for the emitted ids, so an
+    // identical later turn is a fresh occurrence while still-pending
+    // identical repeats from before the pair remain dedup candidates.
+    for (const id of emittedCallIds) {
+      const fingerprints = pendingToolUses.get(id);
+      for (const fingerprint of keptFingerprints.get(id) ?? []) {
+        fingerprints?.delete(fingerprint);
+        const consumed = consumedToolUses.get(id);
+        if (consumed) {
+          consumed.add(fingerprint);
+        } else {
+          consumedToolUses.set(id, new Set([fingerprint]));
+        }
+      }
+      if (fingerprints && fingerprints.size === 0) {
+        pendingToolUses.delete(id);
       }
     }
 

@@ -638,6 +638,12 @@ export function buildMessageParts(params: {
   // context window. Persist one fallback part that carries the pairing
   // identity so assembly can reconstruct the toolResult.
   //
+  // The OpenClaw `details` payload (the motivating `update_plan` case is
+  // `{content: [], details: {...}}`) is persisted in part metadata — the
+  // lossless layer must not discard structured payload data just because the
+  // text content is empty. Oversized payloads are summarized instead of
+  // dropped silently.
+  //
   // Gated on BOTH role and a non-empty pairing id: pre-existing routing in
   // blockFromPart treats a metadata-less "tool" part as a toolCall, so only
   // tool/toolResult roles may land here — an id-bearing assistant/user message
@@ -655,6 +661,23 @@ export function buildMessageParts(params: {
     topLevelToolCallId.length > 0 &&
     !rawPayloadExternalized
   ) {
+    // Structured payload capture (P3: lossless layer must not discard data).
+    // `details` rides the top-level message — e.g. update_plan's
+    // `{content: [], details: {...}}` — so persist it in part metadata even
+    // though the rehydrated provider-facing block stays a whitespace text
+    // block (adapters only accept text/image in toolResult content).
+    const details = (message as { details?: unknown }).details;
+    const EMPTY_FALLBACK_DETAILS_MAX_BYTES = 65536;
+    let detailsEntry: Record<string, unknown> = {};
+    if (details !== undefined) {
+      const serialized = toJson(details);
+      const serializedBytes = Buffer.byteLength(serialized ?? "", "utf8");
+      if (serialized !== undefined && serializedBytes <= EMPTY_FALLBACK_DETAILS_MAX_BYTES) {
+        detailsEntry = { details };
+      } else {
+        detailsEntry = { detailsOversize: { byteSize: serializedBytes } };
+      }
+    }
     parts.push({
       sessionId,
       partType: "tool",
@@ -663,16 +686,16 @@ export function buildMessageParts(params: {
       toolCallId: topLevelToolCallId ?? null,
       toolName: topLevelToolName ?? null,
       metadata: toJson({
-        // Always identify as "toolResult" so blockFromPart routes through
-        // toolResultBlockFromPart (not toolCallBlockFromPart which would
-        // emit a phantom toolCall block). The raw role may be "tool" but
-        // the logical shape is a tool RESULT.
+        // Always identify as "toolResult" (the raw role may be "tool" but
+        // the logical shape is a tool RESULT); the emptyContentFallback flag
+        // routes rehydration to a provider-valid text block.
         originalRole: "toolResult",
         rawType: "tool_result",
         toolCallId: topLevelToolCallId,
         toolName: topLevelToolName,
         isError: topLevelIsError,
         emptyContentFallback: true,
+        ...detailsEntry,
       }),
     });
   }

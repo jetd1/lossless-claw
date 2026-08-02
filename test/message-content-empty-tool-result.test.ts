@@ -157,16 +157,18 @@ describe("buildMessageParts empty-content tool-result fallback", () => {
 });
 
 describe("fallback part assembly routing", () => {
-  it("routes through toolResultBlockFromPart via originalRole metadata", () => {
+  it("rehydrates as a provider-valid text block via the fallback metadata", () => {
     const records = partsOf(makeEmptyResult()).map((part) =>
       toSyntheticMessagePartRecord(part, 1),
     );
     const block = blockFromPart(records[0]!) as Record<string, unknown>;
-    // tool_result shape — NOT a toolCall/function_call phantom.
-    expect(block.type).toBe("tool_result");
-    expect(block.tool_use_id).toBe("call_1");
-    expect(block.name).toBe("update_plan");
-    expect(block.output).toBe(" ");
+    // Provider adapters only accept text/image blocks inside toolResult
+    // message content — the fallback rehydrates as whitespace text; pairing
+    // identity lives on the surrounding message's top-level toolCallId (set
+    // from the part by resolveMessageItem), NOT a nested tool_result block.
+    expect(block.type).toBe("text");
+    expect(block.text).toBe(" ");
+    expect(block.tool_use_id).toBeUndefined();
     expect(block.id).toBeUndefined();
     expect(block.call_id).toBeUndefined();
     expect(JSON.stringify(block)).not.toContain("emptyContentFallback");
@@ -180,23 +182,23 @@ describe("fallback part assembly routing", () => {
     expect(Array.isArray(content)).toBe(true);
     const blocks = content as Array<Record<string, unknown>>;
     expect(blocks).toHaveLength(1);
-    expect(blocks[0]!.type).toBe("tool_result");
-    expect(blocks[0]!.tool_use_id).toBe("call_1");
+    expect(blocks[0]!.type).toBe("text");
+    expect(blocks[0]!.text).toBe(" ");
     // JSON round-trip: no undefined/functions.
     expect(JSON.parse(JSON.stringify(blocks[0]))).toEqual(blocks[0]);
     // Survives the universal empty-content filter.
     expect(isEmptyMessageContent({ role: "toolResult", content })).toBe(false);
   });
 
-  it("normalizeMessageContentForStorage keeps the tool_result block shape", () => {
+  it("normalizeMessageContentForStorage keeps a text block shape", () => {
     const normalized = normalizeMessageContentForStorage({
       message: makeEmptyResult(),
       fallbackContent: "",
     });
     expect(Array.isArray(normalized)).toBe(true);
     const blocks = normalized as Array<Record<string, unknown>>;
-    expect(blocks[0]!.type).toBe("tool_result");
-    expect(blocks[0]!.tool_use_id).toBe("call_1");
+    expect(blocks[0]!.type).toBe("text");
+    expect(blocks[0]!.tool_use_id).toBeUndefined();
   });
 });
 
