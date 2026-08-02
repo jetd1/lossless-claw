@@ -654,7 +654,10 @@ export function sanitizeToolUseResultPairing<T extends AgentMessageLike>(
                 continue;
               }
               const id = extractToolResultId(candidate);
-              if (!id || !toolCallIds.has(id)) {
+              // The breaking assistant turn already survives with this id —
+              // any result for it beyond that turn belongs to the newer
+              // occurrence, never to this span.
+              if (!id || !toolCallIds.has(id) || boundaryClaimedIds.has(id)) {
                 continue;
               }
               const existing = spanResultsById.get(id);

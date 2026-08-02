@@ -669,12 +669,32 @@ export function buildMessageParts(params: {
     const details = (message as { details?: unknown }).details;
     let detailsEntry: Record<string, unknown> = {};
     if (details !== undefined) {
-      // Persist intact: for an empty-content result there are no content
-      // blocks for large-result interception to externalize and raw-payload
-      // externalization skips tool roles, so a byte-size stub would be the
-      // ONLY record — unrecoverable data loss. The lossless invariant wins
-      // over metadata size concerns (update_plan-scale payloads are small).
-      detailsEntry = { details };
+      // Persist intact up to a bound: empty content gives
+      // interceptLargeToolResults nothing to externalize and raw-payload
+      // externalization skips tool roles, so an unbounded details blob both
+      // violates the lossless invariant in the other direction (if trimmed
+      // without evidence elsewhere) and bypasses payload-size controls (if
+      // kept whole) — plus it is reparsed at EVERY assemble. Normal empty
+      // results (update_plan-scale payloads are KBs) stay intact; an
+      // oversized blob keeps byteSize + head preview + a LOUD ingest warning
+      // (P3's "disappear without audible complaint" rationale: the invariant
+      // breach is at least evidence-bearing and audible, unlike silent loss).
+      const EMPTY_FALLBACK_DETAILS_MAX_BYTES = 65536;
+      const serialized = toJson(details);
+      const serializedBytes = Buffer.byteLength(serialized ?? "", "utf8");
+      if (serializedBytes <= EMPTY_FALLBACK_DETAILS_MAX_BYTES) {
+        detailsEntry = { details };
+      } else {
+        console.warn(
+          `[lcm] empty-content tool result details payload ${serializedBytes}B exceeds ${EMPTY_FALLBACK_DETAILS_MAX_BYTES}B cap (toolCallId=${topLevelToolCallId}); byteSize + preview preserved in part metadata`,
+        );
+        detailsEntry = {
+          detailsOversize: {
+            byteSize: serializedBytes,
+            preview: (serialized ?? "").slice(0, 2048),
+          },
+        };
+      }
     }
     parts.push({
       sessionId,

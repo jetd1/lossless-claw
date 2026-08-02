@@ -10,7 +10,7 @@ import { isProviderUniqueToolCallId } from "./stable-event-key.js";
 import type { CreateMessagePartInput } from "./store/conversation-store.js";
 import { extractToolResultIdForPairing } from "./tool-pairing.js";
 import { extractBootstrapMessageCandidate } from "./transcript.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export function createBootstrapEntryHash(message: StoredMessage | null): string | null {
   if (!message) {
@@ -103,6 +103,23 @@ export function createLiveCoverageSignature(message: AgentMessage): string {
   );
   if (canonicalEmptyToolResultSignature) {
     return canonicalEmptyToolResultSignature;
+  }
+  if (stored.role === "tool") {
+    const pairingId = extractToolResultIdForPairing(message);
+    if (pairingId && !isProviderUniqueToolCallId(pairingId)) {
+      // Recurrent model-authored ids: the lossless signature contains no
+      // occurrence identity, so two distinct events with identical content
+      // ("(no output)") sign equal and a coverage consumer can elide a REAL
+      // newer occurrence against an older assembled one. Without provenance
+      // there is no in-message occurrence discriminator, so refuse to let
+      // these events anchor coverage at all: double-emit is recoverable by
+      // repair-time dedup; a sliced-away live event is not (P3).
+      return JSON.stringify({
+        kind: "recurrent-tool-event",
+        toolCallId: pairingId,
+        nonce: randomUUID(),
+      });
+    }
   }
   return createLosslessMessageSignature(message);
 }
